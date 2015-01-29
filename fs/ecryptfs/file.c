@@ -246,9 +246,155 @@ static int ecryptfs_open(struct inode *inode, struct file *file)
 	}
 	ecryptfs_set_file_lower(
 		file, ecryptfs_inode_to_private(inode)->lower_file);
+	if (d_is_dir(ecryptfs_dentry)) {
+#ifdef CONFIG_SDP
+		/*
+		 * it's possible to have a sensitive directory. (vault)
+		 */
+		if (mount_crypt_stat->flags & ECRYPTFS_MOUNT_SDP_ENABLED)
+			crypt_stat->flags |= ECRYPTFS_DEK_SDP_ENABLED;
+#endif
+		ecryptfs_printk(KERN_DEBUG, "This is a directory\n");
+		mutex_lock(&crypt_stat->cs_mutex);
+		crypt_stat->flags &= ~(ECRYPTFS_ENCRYPTED);
+		mutex_unlock(&crypt_stat->cs_mutex);
+		rc = 0;
+		goto out;
+	}
 	rc = read_or_initialize_metadata(ecryptfs_dentry);
 	if (rc)
 		goto out_put;
+	}
+
+#ifdef CONFIG_SDP
+	if (crypt_stat->flags & ECRYPTFS_DEK_IS_SENSITIVE) {
+#ifdef CONFIG_SDP_KEY_DUMP
+		if (d_is_reg(ecryptfs_dentry)) {
+			if(get_sdp_sysfs_key_dump()) {
+				printk("FEK[%s] : ", ecryptfs_dentry->d_name.name);
+				key_dump(crypt_stat->key, 32);
+			}
+		}
+#endif
+		/*
+		 * Need to update sensitive mapping on file open
+		 */
+		if (d_is_reg(ecryptfs_dentry)) {
+			ecryptfs_set_mapping_sensitive(inode, mount_crypt_stat->userid, TO_SENSITIVE);
+		}
+		
+		if (ecryptfs_is_sdp_locked(crypt_stat->engine_id)) {
+			ecryptfs_printk(KERN_INFO, "ecryptfs_open: persona is locked, rc=%d\n", rc);
+		} else {
+			int dek_type = crypt_stat->sdp_dek.type;
+
+			ecryptfs_printk(KERN_INFO, "ecryptfs_open: persona is unlocked, rc=%d\n", rc);
+			if(dek_type != DEK_TYPE_AES_ENC) {
+				ecryptfs_printk(KERN_DEBUG, "converting dek...\n");
+				rc = ecryptfs_sdp_convert_dek(ecryptfs_dentry);
+				ecryptfs_printk(KERN_DEBUG, "conversion ready, rc=%d\n", rc);
+				rc = 0; // TODO: Do we need to return error if conversion fails?
+			}
+		}
+	}
+#if ECRYPTFS_DEK_DEBUG
+	else {
+		ecryptfs_printk(KERN_INFO, "ecryptfs_open: dek_file_type is protected\n");
+	}
+#endif
+#endif
+
+#ifdef CONFIG_DLP
+	if(crypt_stat->flags & ECRYPTFS_DLP_ENABLED) {
+#if DLP_DEBUG
+		printk("DLP %s: try to open %s [%lu] with crypt_stat->flags %d\n",
+				__func__, ecryptfs_dentry->d_name.name, inode->i_ino, crypt_stat->flags);
+#endif
+
+		dlp_len = ecryptfs_dentry->d_inode->i_op->getxattr(
+			ecryptfs_dentry,
+			KNOX_DLP_XATTR_NAME,
+			&dlp_data, sizeof(dlp_data));
+
+		if(dlp_data.expiry_time.tv_sec <= 0){
+#if DLP_DEBUG
+			printk("[LOG] %s: DLP flag is set but it is not DLP file -> media created file but not DLP [%s]\n",
+				__func__, ecryptfs_dentry->d_name.name);
+#endif
+			goto dlp_out;
+		}
+
+		if (dlp_is_locked(mount_crypt_stat->userid)) {
+			printk("%s: DLP locked\n", __func__);
+			rc = -EPERM;
+			goto out_put;
+		}
+
+		if(in_egroup_p(AID_KNOX_DLP) || in_egroup_p(AID_KNOX_DLP_RESTRICTED) || in_egroup_p(AID_KNOX_DLP_MEDIA)) {
+			if (dlp_len == sizeof(dlp_data)) {
+				getnstimeofday(&ts);
+#if DLP_DEBUG
+				printk("DLP %s: current time [%ld/%ld] %s\n",
+						__func__, (long)ts.tv_sec, (long)dlp_data.expiry_time.tv_sec, ecryptfs_dentry->d_name.name);
+#endif
+				if ((ts.tv_sec > dlp_data.expiry_time.tv_sec) &&
+						dlp_isInterestedFile(mount_crypt_stat->userid, ecryptfs_dentry->d_name.name)==0) {
+					
+					if(in_egroup_p(AID_KNOX_DLP_MEDIA)) { //ignore media notifications
+					/* Command to delete expired file  */
+					cmd = sdp_fs_command_alloc(FSOP_DLP_FILE_REMOVE_MEDIA,
+							current->tgid, mount_crypt_stat->userid, mount_crypt_stat->partition_id,
+							inode->i_ino, GFP_KERNEL);
+					} else {
+					/* Command to delete expired file  */
+					cmd = sdp_fs_command_alloc(FSOP_DLP_FILE_REMOVE,
+							current->tgid, mount_crypt_stat->userid, mount_crypt_stat->partition_id,
+							inode->i_ino, GFP_KERNEL);
+					}
+					rc = -ENOENT;
+					goto out_put;
+				}
+			} else if (dlp_len == -ENODATA) {
+				/* DLP flag is set, but no DLP data. Let it continue, xattr will be set later */
+				printk("DLP %s: normal file [%s]\n",
+						__func__, ecryptfs_dentry->d_name.name);
+			} else {
+				printk("DLP %s: Error, len [%ld], [%s]\n",
+						__func__, (long)dlp_len, ecryptfs_dentry->d_name.name);
+				rc = -EFAULT;
+				goto out_put;
+			}
+
+#if DLP_DEBUG
+			printk("DLP %s: DLP file [%s] opened with tgid %d, %d\n" ,
+					__func__, ecryptfs_dentry->d_name.name, current->tgid, in_egroup_p(AID_KNOX_DLP_RESTRICTED));
+#endif
+			if(in_egroup_p(AID_KNOX_DLP_RESTRICTED)) {
+				cmd = sdp_fs_command_alloc(FSOP_DLP_FILE_OPENED,
+						current->tgid, mount_crypt_stat->userid, mount_crypt_stat->partition_id,
+						inode->i_ino, GFP_KERNEL);
+			} else if(in_egroup_p(AID_KNOX_DLP)) {
+				cmd = sdp_fs_command_alloc(FSOP_DLP_FILE_OPENED_CREATOR,
+						current->tgid, mount_crypt_stat->userid, mount_crypt_stat->partition_id,
+						inode->i_ino, GFP_KERNEL);
+			} else {
+				printk("DLP %s: DLP open file file from Media process ignoring sending event\n", __func__);
+			}
+		} else {
+			printk("DLP %s: not DLP app [%s]\n", __func__, current->comm);
+			printk("DLP %s: DLP open file failed\n", __func__);
+			cmd = sdp_fs_command_alloc(FSOP_DLP_FILE_ACCESS_DENIED,
+							current->tgid, mount_crypt_stat->userid, mount_crypt_stat->partition_id,
+							inode->i_ino, GFP_KERNEL);
+							
+			rc = -EPERM;
+			goto out_put;
+		}
+	}
+
+dlp_out:
+#endif
+
 	ecryptfs_printk(KERN_DEBUG, "inode w/ addr = [0x%p], i_ino = "
 			"[0x%.16lx] size: [0x%.16llx]\n", inode, inode->i_ino,
 			(unsigned long long)i_size_read(inode));
